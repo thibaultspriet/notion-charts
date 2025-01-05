@@ -1,11 +1,7 @@
 from flask import Flask, render_template, redirect, request, jsonify
 from os.path import abspath, dirname, join, realpath
 from werkzeug.exceptions import HTTPException
-from requests.exceptions import HTTPError
-from notion.client import NotionClient
 from flask.wrappers import Response
-from itertools import groupby
-from os import getenv
 import traceback
 import json
 
@@ -18,22 +14,7 @@ IMG_WIDTH = 380
 IMG_HEIGHT = 220
 
 TYPES_EXCLUDED = ['relation', 'person', 'date']
-URL_BASE = 'https://www.notion.so/businesstime/{}?v={}'
 CHART_URL = f'https://quickchart.io/chart?w={IMG_WIDTH}&h={IMG_HEIGHT}'
-
-
-if 'client' not in g:
-    try:
-        print('init')
-        # Could use this but we need caching and the endpoint is heavily rate limited
-        # email='', password=''
-        g['client'] = NotionClient(token_v2=getenv('TOKEN_V2'))
-    except HTTPError as error:
-        if error.response.status_code == 401:
-            g['error'] = 'Bad Notion TOKEN_V2.'
-        else:
-            g['error'] = str(error)
-        g['client'] = None
 
 
 def get_client():
@@ -71,45 +52,12 @@ def clean_data(rows, fields):
         res += flatten_row(row)
     return res
 
+def get_datas(*args):
 
-def get_datas(collection, view, columns_schema):
-    if not columns_schema:
-        raise Exception('Bad schema')
-    columns_schema = list(map(lambda x: x.split(':'), columns_schema))
+    class Foo:
+        name = "test"
 
-    try:
-        cv = get_client().get_collection_view(URL_BASE.format(collection, view))
-    except Exception as e:
-        if str(e) == 'Invalid collection view URL':
-            raise Exception('Bad view')
-        raise
-
-    rows = cv.default_query().execute()
-    datas = [list(map(lambda x: x[0], columns_schema))]
-
-    flatten = clean_data(rows, set(map(lambda x: x[1], columns_schema)))
-    grouped = groupby(sorted(flatten, key=lambda x: x[columns_schema[0][1]]), lambda x: x[columns_schema[0][1]])
-
-    for key, group in grouped:
-        datas.append([[]] * len(columns_schema))
-        group = list(group)
-        datas[-1][0] = key
-
-        for i, schema in enumerate(columns_schema):
-            _, field, action = schema
-
-            if action == 'count':
-                datas[-1][i] = len(list(filter(lambda x: x[field], group)))
-            elif action == 'sum':
-                datas[-1][i] = sum(map(lambda x: int(x[field]), group))
-            elif action == 'avg':
-                lst = list(map(lambda x: int(x[field]), group))
-                datas[-1][i] = sum(lst) / len(lst)
-            else:
-                values = set(map(lambda x: x[field], group))
-                datas[-1][i] = ','.join(map(str, values)) if len(values) > 1 else (list(values) or [''])[0]
-
-    return cv, datas
+    return Foo(), [["xx", "Serie 1"], ["Chien", 10], ["Chat", 15], ["Poule", 30]]
 
 
 @app.errorhandler(Exception)
@@ -125,25 +73,6 @@ def handle_error(e):
     return jsonify(error=str(e)), code
 
 
-@app.route('/notion-schema/<collection>/<view>')
-def get_schema(collection, view):
-    """
-    Return schema of the current Notion database.
-    """
-    try:
-        cv = get_client().get_collection_view(URL_BASE.format(collection, view))
-    except Exception as e:
-        if str(e) == 'Invalid collection view URL':
-            raise Exception('Bad view')
-        raise
-
-    rows = cv.default_query().execute()
-
-    return jsonify({
-        'columns': list(filter(lambda x: x['type'] not in TYPES_EXCLUDED, rows[0].schema))
-    }), 200
-
-
 @app.route('/schema-chart/<collection>/<view>')
 def build_schema_chart(collection, view):
     """
@@ -154,6 +83,7 @@ def build_schema_chart(collection, view):
     columns_schema = request.args.get('s', '').split(',')
 
     cv, datas = get_datas(collection, view, columns_schema)
+    print(datas)
 
     if request.headers.get('sec-ch-prefers-color-scheme') == 'dark':
         dark_mode = True
@@ -183,14 +113,14 @@ def build_image_chart(collection, view):
     _, datas = get_datas(collection, view, columns_schema)
 
     force_white_labels = {'legend': {'labels': {'fontColor': 'white'}}}
-    labels = list(map(lambda x: remove_non_ascii(x[0]), datas[1:]))
+    labels = list(map(lambda x: remove_non_ascii(x[0]), datas[1:])) # x axis
     datasets = []
 
     nb_datasets = len(datas[0])
 
     for index in range(1, nb_datasets):
         datasets.append({
-            'label': datas[0][index],
+            'label': datas[0][index], # name of the serie / dataset
             'data': list(map(lambda x: x[index], datas[1:]))
         })
 
@@ -208,6 +138,8 @@ def build_image_chart(collection, view):
             'rotation': 0,
         }
     }
+
+    print(data)
 
     if request.headers.get('sec-ch-prefers-color-scheme') == 'dark':
         dark_mode = True
