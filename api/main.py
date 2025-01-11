@@ -1,3 +1,5 @@
+from typing import Any
+
 from flask import Flask, render_template, redirect, request, jsonify
 from os.path import abspath, dirname, join, realpath
 from werkzeug.exceptions import HTTPException
@@ -5,6 +7,8 @@ from flask.wrappers import Response
 import traceback
 import json
 import requests
+from itertools import groupby
+
 
 
 dir_path = dirname(realpath(__file__))
@@ -18,6 +22,75 @@ TYPES_EXCLUDED = ['relation', 'person', 'date']
 CHART_URL = f'https://quickchart.io/chart?w={IMG_WIDTH}&h={IMG_HEIGHT}'
 NOTION_API_BASE_URL = "https://api.notion.com/"
 NOTION_VERSION = '2022-06-28'
+
+NOTION_PROPERTY_VALUE = {
+    "title": lambda x: x["title"][0]['plain_text'],
+    "number": lambda x: x["number"],
+    "date": lambda x: x["date"]["start"],
+    "array": lambda x: NOTION_PROPERTY_VALUE[x["array"][0]["type"]](x["array"][0]),
+    "formula": lambda x: NOTION_PROPERTY_VALUE[x["formula"]["type"]](x["formula"]),
+    "rollup": lambda x:  NOTION_PROPERTY_VALUE[x["rollup"]["type"]](x["rollup"])
+}
+
+
+def get_value_from_prop(properties: dict, prop: str, mapper: dict, relation_lookup, token) -> Any:
+    """
+    Get the value of a Notion property.
+
+    :param properties: dictionary of page properties
+    :param prop: the name of the property
+    :param mapper: key : type of the property. Value a callable giving the value.
+    """
+    _type = properties[prop]["type"]
+    if _type == "relation":
+        related_id = properties[prop][_type][0]['id']
+        if related_id in relation_lookup:
+            return relation_lookup[related_id]
+        else:
+            res = requests.get(
+                f"{NOTION_API_BASE_URL}v1/pages/{related_id}/properties/title",
+                headers={"Authorization": f"Bearer {token}", "Notion-Version": NOTION_VERSION},
+            ).json()
+            value = res["results"][0]["title"]["plain_text"]
+            relation_lookup[related_id] = value
+            return value
+    else:
+        return mapper[_type](properties[prop])
+
+
+def aggregate(datas, column_schema):
+    column_names = list(map(lambda x: x.split(":")[0], column_schema))
+
+    datas.sort(key=lambda x: x[0])
+
+    groups = groupby(datas, key=lambda x: x[0])
+
+    series = []
+
+    for key, group in groups:
+        serie = [key]
+        group = list(group)
+        for i, schema in enumerate(column_schema[1:]):
+            col, action = schema.split(":")
+
+            if action == 'count':
+                serie.append(len(list(filter(lambda x: x[i + 1] is not None, group))))
+            elif action == 'sum':
+                serie.append(sum(map(lambda x: x[i + 1] if x[i + 1] is not None else 0, group)))
+            elif action == 'avg':
+                group = list(group)
+                _serie = [x[i + 1] for x in group if x[i + 1] is not None]
+                serie.append(sum(_serie) / len(_serie) if len(_serie) > 0 else 0)
+            elif action == 'value':
+                serie.append(",".join(list(map(lambda x: str(x[i + 1]) if x[i + 1] is not None else "", list(group)))))
+            else:
+                raise RuntimeError(f"action {action} not implemented")
+        series.append(serie)
+
+    return [
+        column_names
+    ] + series
+
 
 
 def remove_non_ascii(string):
@@ -49,19 +122,13 @@ def clean_data(rows, fields):
 
 
 def get_datas(collection: str, column_schema: list, notion_bearer_token: str):
-
-    # class Foo:
-    #     name = "test"
-    #
-    # return Foo(), [["xx", "Serie 1"], ["Chien", 10], ["Chat", 15], ["Poule", 30]]
     headers = {"Authorization": f"Bearer {notion_bearer_token}", "Notion-Version": NOTION_VERSION}
     column_names = list(map(lambda x: x.split(":")[0], column_schema))
 
     # Get propery IDs
     res = requests.get(
         f"{NOTION_API_BASE_URL}v1/databases/{collection}",
-        headers=headers,
-        verify=False
+        headers=headers
     ).json()
 
     property_ids = [res["properties"].get(name).get("id") for name in column_names]
@@ -75,16 +142,23 @@ def get_datas(collection: str, column_schema: list, notion_bearer_token: str):
             f"{NOTION_API_BASE_URL}v1/databases/{collection}/query?{filter_properties}",
             headers={"Authorization": f"Bearer {notion_bearer_token}", "Notion-Version": NOTION_VERSION},
             data={"next_cursor": next_cursor},
-            verify=False
         ).json()
 
         pages += current["results"]
         has_more = current.get("has_more", False)
         next_cursor = current.get("next_cursor")
-    return pages
 
+    relation_lookup = {}
 
+    data = [
+        [get_value_from_prop(page["properties"], prop, NOTION_PROPERTY_VALUE, relation_lookup, notion_bearer_token) for prop in column_names] for page in
+        pages
+    ]
 
+    class Foo:
+        name = column_names[0]
+
+    return Foo(), aggregate(data, column_schema)
 
 
 @app.errorhandler(Exception)
@@ -108,9 +182,9 @@ def build_schema_chart(collection):
     dark_mode = 'dark' in request.args
     chart_type = request.args.get('t', 'PieChart')
     columns_schema = request.args.get('s', '').split(',')
+    token = request.args.get("token")
 
-    cv, datas = get_datas(collection, columns_schema)
-    print(datas)
+    cv, datas = get_datas(collection, columns_schema, token)
 
     if request.headers.get('sec-ch-prefers-color-scheme') == 'dark':
         dark_mode = True
@@ -136,8 +210,9 @@ def build_image_chart(collection):
     dark_mode = 'dark' in request.args
     chart_type = request.args.get('t', 'PieChart')
     columns_schema = request.args.get('s', '').split(',')
+    token = request.args.get("token")
 
-    _, datas = get_datas(collection, columns_schema)
+    _, datas = get_datas(collection, columns_schema, token)
 
     force_white_labels = {'legend': {'labels': {'fontColor': 'white'}}}
     labels = list(map(lambda x: remove_non_ascii(x[0]), datas[1:])) # x axis
@@ -165,8 +240,6 @@ def build_image_chart(collection):
             'rotation': 0,
         }
     }
-
-    print(data)
 
     if request.headers.get('sec-ch-prefers-color-scheme') == 'dark':
         dark_mode = True
