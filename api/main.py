@@ -172,6 +172,8 @@ def get_datas(collection: str, column_schema: list, notion_bearer_token: str, db
         headers=headers,
     ).json()
 
+    print(res)
+
     property_ids = [res["properties"].get(name).get("id") for name in column_names]
 
     filter_properties = "&".join([f"filter_properties={name}" for name in property_ids])
